@@ -10,7 +10,7 @@
 
 import ffi
 
-import std/[tables, sets, json, locks]
+import std/[tables, sequtils, sets, json, locks]
 import metrics
 
 import ../libp2p
@@ -98,6 +98,30 @@ type Libp2pConfig {.ffi.} = object
   autonatV2: bool
   autonatV2Server: bool
 
+type PeerInfoResponse {.ffi.} = object
+  peerId: string
+  addrs: seq[string]
+
+type PeersResponse {.ffi.} = object
+  peerIds: seq[string]
+
+type ConnectRequest {.ffi.} = object
+  peerId: string
+  multiaddrs: seq[string]
+  timeoutMs: int64
+
+type DialRequest {.ffi.} = object
+  peerId: string
+  proto: string
+
+type DialResponse {.ffi.} = object
+  streamId: uint64
+
+type DialCircuitRelayRequest {.ffi.} = object
+  peerId: string
+  multiaddr: string
+  proto: string
+
 func parseTransport(v: int): Result[TransportType, string] =
   case v
   of ord(TransportType.QUIC):
@@ -130,6 +154,14 @@ proc parseBootstrapNodes(
       addrs.add(ma)
     response.add((peerId, addrs))
   ok(response)
+
+proc parseMultiaddrs(addrs: seq[string]): Result[seq[MultiAddress], string] =
+  var parsed: seq[MultiAddress]
+  for a in addrs:
+    let ma = MultiAddress.init(a).valueOr:
+      return err("invalid multiaddress '" & a & "': " & $error)
+    parsed.add(ma)
+  ok(parsed)
 
 proc mountGossipsub(lib: LibP2P, config: Libp2pConfig): Result[void, string] =
   if not config.mountGossipsub:
@@ -289,5 +321,101 @@ proc libp2pStart*(lib: LibP2P): Future[Result[bool, string]] {.ffi.} =
 proc libp2pStop*(lib: LibP2P): Future[Result[bool, string]] {.ffi.} =
   await lib.switch.stop()
   ok(true)
+
+proc libp2pPublicKey*(lib: LibP2P): Future[Result[seq[byte], string]] {.ffi.} =
+  let peerInfo = lib.switch.peerInfo
+  if peerInfo.isNil():
+    return err("switch peerInfo is nil")
+
+  let pubKey =
+    case peerInfo.publicKey.scheme
+    of PKScheme.Secp256k1:
+      peerInfo.publicKey.skkey
+    else:
+      return err("peerInfo public key must be secp256k1")
+
+  ok(@(pubKey.getBytes()))
+
+proc libp2pConnect*(
+    lib: LibP2P, req: ConnectRequest
+): Future[Result[bool, string]] {.ffi.} =
+  let multiaddresses = parseMultiaddrs(req.multiaddrs).valueOr:
+    return err(error)
+
+  let peerId = PeerId.init(req.peerId).valueOr:
+    return err($error)
+
+  let timeout =
+    if req.timeoutMs <= 0:
+      InfiniteDuration
+    else:
+      chronos.milliseconds(req.timeoutMs)
+
+  try:
+    await lib.switch.connect(peerId, multiaddresses).wait(timeout)
+  except AsyncTimeoutError:
+    return err("dial timeout")
+  except DialFailedError as e:
+    return err(e.msg)
+
+  ok(true)
+
+proc libp2pDisconnect*(
+    lib: LibP2P, peerId: string
+): Future[Result[bool, string]] {.ffi.} =
+  let pid = PeerId.init(peerId).valueOr:
+    return err($error)
+  await lib.switch.disconnect(pid)
+  ok(true)
+
+proc libp2pPeerInfo*(lib: LibP2P): Future[Result[PeerInfoResponse, string]] {.ffi.} =
+  let peerInfo = lib.switch.peerInfo
+  if peerInfo.isNil():
+    return err("switch peerInfo is nil")
+  try:
+    ok(PeerInfoResponse(peerId: $peerInfo.peerId, addrs: peerInfo.addrs.mapIt($it)))
+  except LPError as e:
+    err(e.msg)
+
+proc libp2pConnectedPeers*(
+    lib: LibP2P, direction: int
+): Future[Result[PeersResponse, string]] {.ffi.} =
+  let dir =
+    case direction
+    of ord(Direction.In):
+      Direction.In
+    of ord(Direction.Out):
+      Direction.Out
+    else:
+      return err("invalid direction: " & $direction)
+
+  let peers = lib.switch.connectedPeers(dir)
+  ok(PeersResponse(peerIds: peers.mapIt($it)))
+
+proc libp2pDial*(
+    lib: LibP2P, req: DialRequest
+): Future[Result[DialResponse, string]] {.ffi.} =
+  let peerId = PeerId.init(req.peerId).valueOr:
+    return err($error)
+  let stream =
+    try:
+      await lib.switch.dial(peerId, req.proto)
+    except DialFailedError as e:
+      return err(e.msg)
+  ok(DialResponse(streamId: lib.streams.register(stream)))
+
+proc libp2pDialCircuitRelay*(
+    lib: LibP2P, req: DialCircuitRelayRequest
+): Future[Result[DialResponse, string]] {.ffi.} =
+  let dstPeerId = PeerId.init(req.peerId).valueOr:
+    return err($error)
+  let relayCircuitAddr = MultiAddress.init(req.multiaddr).valueOr:
+    return err($error)
+  let stream =
+    try:
+      await lib.switch.dial(dstPeerId, @[relayCircuitAddr], req.proto)
+    except DialFailedError as e:
+      return err(e.msg)
+  ok(DialResponse(streamId: lib.streams.register(stream)))
 
 genBindings()
