@@ -6,10 +6,18 @@ author = "Status Research & Development GmbH"
 description = "C bindings for LibP2P implementation"
 license = "MIT"
 
-import os, strutils
+import os, strutils, sequtils
 
 # The rest of dependencies is inherited from parent libp2p.nimble via nimble.paths
 requires "taskpools >= 0.1.0"
+requires "https://github.com/logos-messaging/nim-ffi#7e3fd96e7417528fecdd0d685fc8fd29a3fd6bfd"
+
+task install_pinned,
+  "Install cbind's pinned deps (taskpools, cbor_serialization, nim-ffi)":
+  # cbind-scoped lock; kept out of the repo-root .pinned so the main libp2p CI
+  # (which doesn't use these) and its Nim 2.2.4 job stay untouched.
+  let deps = readFile(".pinned").splitWhitespace().mapIt(it.split(";", 1)[1])
+  exec "nimble install -y " & deps.join(" ")
 
 proc getLibExt(libType: string): string =
   if libType == "static":
