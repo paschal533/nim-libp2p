@@ -29,9 +29,12 @@ import ../libp2p/protocols/service_discovery/types
 import ../libp2p/protocols/connectivity/relay/client
 
 type StreamRegistry = object
-  ## Owns the live streams handed out across the FFI boundary.
+  ## Owns the live streams handed out across the FFI boundary and the
+  ## release-waiter futures that keep custom-protocol handlers alive until the
+  ## host is done with the stream.
   streams: Table[uint64, Stream]
   nextStreamId: uint64
+  releaseWaiters: Table[uint64, Future[void].Raising([CancelledError])]
 
 type LibP2P* = ref object
   ## Main library state. The FFI context owns one instance; its tables mutate
@@ -76,6 +79,27 @@ type DialCircuitRelayRequest {.ffi.} = object
   proto: string
   timeoutMs: int64
 
+type StreamWriteRequest {.ffi.} = object
+  streamId: uint64
+  data: seq[byte]
+
+type StreamReadExactlyRequest {.ffi.} = object
+  streamId: uint64
+  numBytes: int64
+
+type StreamReadLpRequest {.ffi.} = object
+  streamId: uint64
+  maxSize: int64
+
+type ReadResponse {.ffi.} = object
+  data: seq[byte]
+
+type IncomingStreamEvent {.ffi.} = object
+  proto: string
+  streamId: uint64
+
+proc onIncomingStream*(event: IncomingStreamEvent) {.ffiEvent: "on_incoming_stream".}
+
 proc register(reg: var StreamRegistry, stream: Stream): uint64 =
   reg.nextStreamId.inc()
   let id = reg.nextStreamId
@@ -87,6 +111,15 @@ func get(reg: StreamRegistry, id: uint64): Result[Stream, string] =
   if stream.isNil():
     return err("unknown stream handle")
   ok(stream)
+
+proc release(reg: var StreamRegistry, id: uint64) =
+  # Completes the waiting protocol handler so multistream doesn't close the stream early.
+  let releaseWaiter = reg.releaseWaiters.getOrDefault(id, nil)
+  if not releaseWaiter.isNil():
+    reg.releaseWaiters.del(id)
+    if not releaseWaiter.finished():
+      releaseWaiter.complete()
+  reg.streams.del(id)
 
 const MaxReadBytes = 64 * 1024 * 1024
   ## Upper bound on a single stream read. Caps the buffer an untrusted peer can
@@ -396,5 +429,121 @@ proc libp2pDialCircuitRelay*(
     except DialFailedError as e:
       return err(e.msg)
   ok(DialResponse(streamId: lib.streams.register(stream)))
+
+func validateReadLength(n: int64): Result[int, string] =
+  ## Guards attacker-controlled read lengths before they size an allocation:
+  ## rejects negatives and anything past the `MaxReadBytes` DoS ceiling. The
+  ## ceiling (64 MiB) sits well below `int.high` even on 32-bit targets, so the
+  ## `int(n)` narrowing below is always safe; `int.high` stays as a backstop in
+  ## case the ceiling is ever raised.
+  if n < 0:
+    return err("invalid read length")
+  if n > MaxReadBytes:
+    return err("read length exceeds maximum")
+  if n > int.high:
+    return err("read length too large")
+  ok(int(n))
+
+proc libp2pStreamReadExactly*(
+    lib: LibP2P, req: StreamReadExactlyRequest
+): Future[Result[ReadResponse, string]] {.ffi.} =
+  let stream = ?lib.streams.get(req.streamId)
+  let expected = ?validateReadLength(req.numBytes)
+  if expected == 0:
+    return ok(ReadResponse(data: @[]))
+  var buf = newSeqUninit[byte](expected)
+  try:
+    await stream.readExactly(addr buf[0], expected)
+  except LPStreamError as e:
+    return err(e.msg)
+  ok(ReadResponse(data: buf))
+
+proc libp2pStreamReadLp*(
+    lib: LibP2P, req: StreamReadLpRequest
+): Future[Result[ReadResponse, string]] {.ffi.} =
+  let stream = ?lib.streams.get(req.streamId)
+  let maxSize = ?validateReadLength(req.maxSize)
+  let data =
+    try:
+      await stream.readLp(maxSize)
+    except LPStreamError as e:
+      return err(e.msg)
+  ok(ReadResponse(data: data))
+
+proc libp2pStreamWrite*(
+    lib: LibP2P, req: StreamWriteRequest
+): Future[Result[bool, string]] {.ffi.} =
+  let stream = ?lib.streams.get(req.streamId)
+  try:
+    await stream.write(req.data)
+  except LPStreamError as e:
+    return err(e.msg)
+  ok(true)
+
+proc libp2pStreamWriteLp*(
+    lib: LibP2P, req: StreamWriteRequest
+): Future[Result[bool, string]] {.ffi.} =
+  let stream = ?lib.streams.get(req.streamId)
+  try:
+    await stream.writeLp(req.data)
+  except LPStreamError as e:
+    return err(e.msg)
+  ok(true)
+
+proc libp2pStreamClose*(
+    lib: LibP2P, streamId: uint64
+): Future[Result[bool, string]] {.ffi.} =
+  let stream = ?lib.streams.get(streamId)
+  await stream.close()
+  ok(true)
+
+proc libp2pStreamCloseWithEof*(
+    lib: LibP2P, streamId: uint64
+): Future[Result[bool, string]] {.ffi.} =
+  let stream = ?lib.streams.get(streamId)
+  await stream.closeWithEOF()
+  ok(true)
+
+proc libp2pStreamRelease*(
+    lib: LibP2P, streamId: uint64
+): Future[Result[bool, string]] {.ffi.} =
+  discard ?lib.streams.get(streamId)
+  lib.streams.release(streamId)
+  ok(true)
+
+proc libp2pMountProtocol*(
+    lib: LibP2P, proto: string
+): Future[Result[bool, string]] {.ffi.} =
+  if proto.len == 0:
+    return err("proto is empty")
+  if lib.switch.isNil():
+    return err("libp2p switch is not initialized")
+
+  let peerInfo = lib.switch.peerInfo
+  if lib.customProtocols.hasKey(proto) or proto in peerInfo.protocols:
+    return err("protocol already mounted: " & proto)
+
+  proc handle(
+      stream: Stream, selectedProto: string
+  ) {.async: (raises: [CancelledError]).} =
+    let streamId = lib.streams.register(stream)
+    defer:
+      lib.streams.release(streamId)
+    let releaseWaiter =
+      Future[void].Raising([CancelledError]).init("cbind custom protocol release")
+    lib.streams.releaseWaiters[streamId] = releaseWaiter
+    onIncomingStream(IncomingStreamEvent(proto: selectedProto, streamId: streamId))
+    await releaseWaiter
+
+  let mountedProtocol = LPProtocol.new(codecs = @[proto], handler = handle)
+  await mountedProtocol.start()
+
+  try:
+    lib.switch.mount(mountedProtocol)
+  except LPError as e:
+    return err(e.msg)
+
+  lib.customProtocols[proto] = mountedProtocol
+  ok(true)
 
 genBindings()

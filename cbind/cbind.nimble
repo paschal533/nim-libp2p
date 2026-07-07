@@ -55,38 +55,49 @@ task libDynamic, "Generate dynamic bindings":
 task libStatic, "Generate static bindings":
   buildCBindings "static", ""
 
-proc findNatPkgDir(): string =
-  # Match the top-level Makefile: nimble installs deps under pkgs2 on newer
-  # versions and pkgs on older ones; resolve from either.
-  for base in ["../nimbledeps/pkgs2", "../nimbledeps/pkgs"]:
-    if dirExists(base):
-      for d in listDirs(base):
-        if d.extractFilename().startsWith("nat_traversal-"):
-          return d
-  quit "nat_traversal package not found under ../nimbledeps/pkgs2 or " &
-    "../nimbledeps/pkgs; run 'nimble install_pinned' first"
+proc findFfiVendorDir(): string =
+  ## Locates the TinyCBOR sources vendored inside the installed nim-ffi package.
+  var bases = @["../nimbledeps/pkgs2"]
+  let home = getEnv("HOME")
+  if home.len > 0:
+    bases.add home & "/.nimble/pkgs2"
+  for base in bases:
+    if not dirExists(base):
+      continue
+    for entry in listDirs(base):
+      if not entry.extractFilename().startsWith("ffi-"):
+        continue
+      let vendor = entry & "/ffi/codegen/templates/cpp/vendor"
+      if fileExists(vendor & "/tinycbor/cbor.h"):
+        return vendor
+  raise newException(
+    IOError, "could not locate nim-ffi's vendored tinycbor; run `nimble setup` first"
+  )
 
-task examples, "Build and run C bindings examples":
-  buildCBindings "static", ""
-  # libp2p.a transitively references miniupnpc and libnatpmp via nat_traversal.
-  # Build the vendored .a's via the parent Makefile and link them in.
-  exec "make -C .. nat_libs"
-  let natPkg = findNatPkgDir()
-  # miniupnpc's unix Makefile drops the .a under build/, but its Makefile.mingw
-  # drops it at the package root. Match the parent Makefile's per-OS choice.
-  let upnpA =
-    when defined(windows):
-      natPkg / "vendor/miniupnp/miniupnpc/libminiupnpc.a"
-    else:
-      natPkg / "vendor/miniupnp/miniupnpc/build/libminiupnpc.a"
-  let pmpA = natPkg / "vendor/libnatpmp-upstream/libnatpmp.a"
-  let natLibs = upnpA & " " & pmpA
-  exec "g++ -I. -o ../build/cbindings ./examples/cbindings.c ../build/libp2p.a " &
-    natLibs & " -pthread"
-  exec "g++ -I. -o ../build/echo ./examples/echo.c ../build/libp2p.a " & natLibs &
-    " -pthread"
-  exec "../build/cbindings"
-  exec "../build/echo"
+task examples, "Build and run the C bindings examples":
+  let lib = "../build/liblibp2p." & ffiLibExt()
+  if not fileExists(lib):
+    buildFfiLib()
+  if not fileExists("c_bindings/libp2p.h"):
+    genBindingsFor("c", "c_bindings")
+
+  let vendor = findFfiVendorDir()
+  var cborObjs: seq[string]
+  for name in [
+    "cborencoder", "cborencoder_close_container_checked", "cborparser",
+    "cborparser_dup_string", "cborerrorstrings",
+  ]:
+    let obj = "../build/" & name & ".o"
+    exec "gcc -std=c99 -O2 -fPIC -I " & vendor & " -I " & vendor & "/tinycbor -c " &
+      vendor & "/tinycbor/" & name & ".c -o " & obj
+    cborObjs.add obj
+  let cborObjsStr = cborObjs.join(" ")
+
+  for example in ["echo"]:
+    let outBin = "../build/" & example
+    exec "gcc -std=c11 -O2 -I c_bindings -I " & vendor & " examples/" & example & ".c " &
+      cborObjsStr & " " & lib & " -pthread -Wl,-rpath,'$ORIGIN' -o " & outBin
+    exec outBin
 
 # nim-ffi library, built in parallel to the legacy cbind above (see libp2p_ffi.nim).
 # Renamed over libp2p.nim at the flip PR, which drops everything above this line.
