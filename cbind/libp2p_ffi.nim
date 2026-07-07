@@ -1,0 +1,293 @@
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Copyright (c) Status Research & Development GmbH
+
+## C FFI bindings for nim-libp2p, built on top of `nim-ffi`.
+##
+## `nim-ffi` provides the FFI runtime and generates the C/CDDL bindings. This
+## file only declares the library state, the request/response shapes and the
+## libp2p-specific bodies; `genBindings()` at the bottom emits the foreign
+## bindings consumed by `logos-co/logos-libp2p-module`.
+
+import ffi
+
+import std/[tables, sets, json, locks]
+import metrics
+
+import ../libp2p
+import ../libp2p/[multiaddress, peerid]
+import ../libp2p/crypto/crypto
+import ../libp2p/crypto/secp
+import ../libp2p/nameresolving/[dnsresolver, nameresolver]
+import ../libp2p/protocols/pubsub/gossipsub
+import ../libp2p/protocols/protocol
+import ../libp2p/protocols/ping
+import ../libp2p/protocols/kademlia
+import ../libp2p/protocols/service_discovery
+import ../libp2p/protocols/service_discovery/types
+import ../libp2p/protocols/connectivity/relay/client
+import ../libp2p/extended_peer_record
+
+type StreamRegistry = object
+  ## Owns the live streams handed out across the FFI boundary.
+  streams: Table[uint64, Stream]
+  nextStreamId: uint64
+
+type LibP2P* = ref object
+  ## Main library state. The FFI context owns one instance; its tables mutate
+  ## through the `lib` receiver of every `{.ffi.}` proc.
+  switch: Switch
+  rng: Rng
+  gossipSub: Opt[GossipSub]
+  kad: Opt[KadDHT]
+  relayClient: Opt[RelayClient]
+  topicHandlers: Table[string, TopicHandler]
+  customProtocols: Table[string, LPProtocol]
+  streams: StreamRegistry
+
+declareLibrary("libp2p", LibP2P)
+
+proc register(reg: var StreamRegistry, stream: Stream): uint64 =
+  reg.nextStreamId.inc()
+  let id = reg.nextStreamId
+  reg.streams[id] = stream
+  id
+
+func get(reg: StreamRegistry, id: uint64): Result[Stream, string] =
+  let stream = reg.streams.getOrDefault(id, nil)
+  if stream.isNil():
+    return err("unknown stream handle")
+  ok(stream)
+
+const MaxReadBytes = 64 * 1024 * 1024
+  ## Upper bound on a single stream read. Caps the buffer an untrusted peer can
+  ## make us pre-allocate before any byte arrives; well above libp2p's largest
+  ## framed messages, so legitimate reads are unaffected.
+
+type TransportType {.pure.} = enum
+  QUIC
+  TCP
+
+type MuxerType {.pure.} = enum
+  MPLEX
+  YAMUX
+
+type BootstrapNode {.ffi.} = object
+  peerId: string
+  multiaddrs: seq[string]
+
+type Libp2pConfig {.ffi.} = object
+  mountGossipsub: bool
+  gossipsubTriggerSelf: bool
+  mountKad: bool
+  mountServiceDiscovery: bool
+  dnsResolver: string
+  addrs: seq[string]
+  # `MuxerType`/`TransportType` ordinals, passed as `int` because nim-ffi can't
+  # yet carry a Nim enum across the wire (see parseMuxer/parseTransport).
+  muxer: int
+  transport: int
+  bootstrapNodes: seq[BootstrapNode]
+  privKey: seq[byte]
+  maxConnections: int
+  maxIn: int
+  maxOut: int
+  maxConnsPerPeer: int
+  circuitRelay: bool
+  circuitRelayClient: bool
+  autonat: bool
+  autonatV2: bool
+  autonatV2Server: bool
+
+func parseTransport(v: int): Result[TransportType, string] =
+  case v
+  of ord(TransportType.QUIC):
+    ok(TransportType.QUIC)
+  of ord(TransportType.TCP):
+    ok(TransportType.TCP)
+  else:
+    err("invalid transport")
+
+func parseMuxer(v: int): Result[MuxerType, string] =
+  case v
+  of ord(MuxerType.MPLEX):
+    ok(MuxerType.MPLEX)
+  of ord(MuxerType.YAMUX):
+    ok(MuxerType.YAMUX)
+  else:
+    err("invalid muxer")
+
+proc parseBootstrapNodes(
+    config: Libp2pConfig
+): Result[seq[(PeerId, seq[MultiAddress])], string] =
+  var response: seq[(PeerId, seq[MultiAddress])]
+  for node in config.bootstrapNodes:
+    let peerId = PeerId.init(node.peerId).valueOr:
+      return err("invalid bootstrap peer id: " & $error)
+    var addrs: seq[MultiAddress]
+    for a in node.multiaddrs:
+      let ma = MultiAddress.init(a).valueOr:
+        return err("invalid bootstrap multiaddr: " & $error)
+      addrs.add(ma)
+    response.add((peerId, addrs))
+  ok(response)
+
+proc mountGossipsub(lib: LibP2P, config: Libp2pConfig): Result[void, string] =
+  if not config.mountGossipsub:
+    return ok()
+  let gs = GossipSub.init(
+    switch = lib.switch, triggerSelf = config.gossipsubTriggerSelf, rng = lib.rng
+  )
+  try:
+    lib.switch.mount(gs)
+  except LPError as e:
+    return err(e.msg)
+  lib.gossipSub = Opt.some(gs)
+  ok()
+
+proc mountKad(lib: LibP2P, config: Libp2pConfig): Result[void, string] =
+  if not (config.mountKad or config.mountServiceDiscovery):
+    return ok()
+  let bootstrapNodes = parseBootstrapNodes(config).valueOr:
+    return err(error)
+  # Validator/selector are host callbacks that can't cross the FFI boundary, so use defaults.
+  let kadCfg = KadDHTConfig.new(
+    validator = DefaultEntryValidator(), selector = DefaultEntrySelector()
+  )
+  try:
+    if config.mountServiceDiscovery:
+      let k = ServiceDiscovery.new(
+        lib.switch,
+        bootstrapNodes = bootstrapNodes,
+        config = kadCfg,
+        rng = lib.rng,
+        codec = ExtendedServiceDiscoveryCodec,
+      )
+      lib.switch.mount(k)
+      lib.kad = Opt.some(KadDHT(k))
+    else:
+      let k = KadDHT.new(
+        lib.switch, bootstrapNodes = bootstrapNodes, config = kadCfg, rng = lib.rng
+      )
+      lib.switch.mount(k)
+      lib.kad = Opt.some(k)
+  except LPError as e:
+    return err(e.msg)
+  ok()
+
+proc mountProtocols(lib: LibP2P, config: Libp2pConfig): Result[void, string] =
+  ?mountGossipsub(lib, config)
+  ?mountKad(lib, config)
+  try:
+    lib.switch.mount(Ping.new(rng = lib.rng))
+  except LPError as e:
+    return err(e.msg)
+  ok()
+
+proc createLibp2pNode(config: Libp2pConfig): Result[LibP2P, string] =
+  let dnsServersAddrs =
+    if config.dnsResolver.len == 0:
+      DefaultDnsServers
+    else:
+      try:
+        @[initTAddress(config.dnsResolver)]
+      except TransportAddressError as e:
+        return err("invalid dnsResolver address: " & e.msg)
+
+  let rng = newRng()
+
+  var privKey = Opt.none(PrivateKey)
+  if config.privKey.len > 0:
+    let parsedKey = PrivateKey.init(config.privKey).valueOr:
+      return err("invalid private key: " & $error)
+    privKey = Opt.some(parsedKey)
+
+  var addrs: seq[MultiAddress]
+  for a in config.addrs:
+    let address = MultiAddress.init(a).valueOr:
+      return err("invalid listen address: " & $error)
+    addrs.add(address)
+
+  let transport = parseTransport(config.transport).valueOr:
+    return err(error)
+
+  var switchBuilder = SwitchBuilder
+    .new()
+    .withRng(rng)
+    .withMaxConnsPerPeer(config.maxConnsPerPeer)
+    .withNameResolver(cast[NameResolver](DnsResolver.new(dnsServersAddrs)))
+    .withNoise()
+    .withPrivateKey(privKey)
+    .withAddresses(addrs)
+
+  case transport
+  of TransportType.QUIC:
+    switchBuilder = switchBuilder.withQuicTransport()
+  of TransportType.TCP:
+    switchBuilder = switchBuilder.withTcpTransport()
+    let muxer = parseMuxer(config.muxer).valueOr:
+      return err(error)
+    case muxer
+    of MuxerType.MPLEX:
+      switchBuilder = switchBuilder.withMplex()
+    of MuxerType.YAMUX:
+      switchBuilder = switchBuilder.withYamux()
+
+  if config.maxIn > 0 and config.maxOut > 0:
+    switchBuilder = switchBuilder.withConnectionLimits(
+      ConnectionLimits.maxInOut(config.maxIn, config.maxOut)
+    )
+  elif config.maxConnections > 0:
+    switchBuilder = switchBuilder.withConnectionLimits(
+      ConnectionLimits.maxTotal(config.maxConnections)
+    )
+
+  var relayClientOpt = Opt.none(RelayClient)
+  if config.circuitRelayClient:
+    let cl = RelayClient.new()
+    switchBuilder = switchBuilder.withCircuitRelay(cl)
+    relayClientOpt = Opt.some(cl)
+  elif config.circuitRelay:
+    switchBuilder = switchBuilder.withCircuitRelay()
+
+  if config.autonat:
+    switchBuilder = switchBuilder.withAutonat()
+
+  if config.autonatV2:
+    switchBuilder = switchBuilder.withNAT(autonatConfig(AutonatV2))
+
+  if config.autonatV2Server:
+    switchBuilder = switchBuilder.withAutonatV2Server()
+
+  let switch =
+    try:
+      switchBuilder.build()
+    except CatchableError as e:
+      return err("could not create libp2p node: " & e.msg)
+
+  let lib = LibP2P(switch: switch, rng: rng, relayClient: relayClientOpt)
+
+  ?mountProtocols(lib, config)
+
+  ok(lib)
+
+proc libp2pNew*(config: Libp2pConfig): Future[Result[LibP2P, string]] {.ffiCtor.} =
+  try:
+    return createLibp2pNode(config)
+  except CatchableError as e:
+    return err("could not create libp2p node: " & e.msg)
+
+proc libp2pDestroy*(lib: LibP2P) {.ffiDtor.} =
+  discard
+
+proc libp2pStart*(lib: LibP2P): Future[Result[bool, string]] {.ffi.} =
+  try:
+    await lib.switch.start()
+  except LPError as e:
+    return err(e.msg)
+  ok(true)
+
+proc libp2pStop*(lib: LibP2P): Future[Result[bool, string]] {.ffi.} =
+  await lib.switch.stop()
+  ok(true)
+
+genBindings()
