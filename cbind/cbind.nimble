@@ -3,12 +3,12 @@ mode = ScriptMode.Verbose
 packageName = "cbind"
 version = "0.1.0"
 author = "Status Research & Development GmbH"
-description = "C bindings for LibP2P implementation"
+description = "C bindings for nim-libp2p, generated via nim-ffi"
 license = "MIT"
 
 import os, strutils, sequtils
 
-# The rest of dependencies is inherited from parent libp2p.nimble via nimble.paths
+# Most deps come from the parent libp2p.nimble via nimble.paths; nim-ffi pulls in the rest.
 requires "taskpools >= 0.1.0"
 requires "https://github.com/logos-messaging/nim-ffi#7e3fd96e7417528fecdd0d685fc8fd29a3fd6bfd"
 
@@ -19,39 +19,39 @@ task install_pinned,
   let deps = readFile(".pinned").splitWhitespace().mapIt(it.split(";", 1)[1])
   exec "nimble install -y " & deps.join(" ")
 
-proc getLibExt(libType: string): string =
-  if libType == "static":
-    "a"
+proc getLibExt(): string =
+  when defined(windows):
+    "dll"
+  elif defined(macosx):
+    "dylib"
   else:
-    when defined(windows):
-      "dll"
-    elif defined(macosx):
-      "dylib"
-    else:
-      "so"
+    "so"
 
-proc buildCBindings(libType: string, params = "") =
+proc buildFfiLib() =
   let buildDir = "../build"
-
   if not dirExists buildDir:
     mkDir buildDir
+  # Name the output `lib<name>` so the file matches the soname nim derives from
+  # the module; `--nimMainPrefix:liblibp2p` matches the `liblibp2pNimMain` symbol
+  # nim-ffi's `declareLibrary` imports.
+  exec "nim c --out:" & buildDir & "/liblibp2p." & getLibExt() &
+    " --threads:on --app:lib --opt:size --noMain --mm:refc -d:metrics" &
+    " --nimMainPrefix:liblibp2p --nimcache:nimcache libp2p.nim"
 
-  var extra_params = params
-  for i in 2 ..< paramCount():
-    extra_params &= " " & paramStr(i)
+task buildffi, "Build the FFI shared library":
+  buildFfiLib()
 
-  let ext = getLibExt(libType)
-  let app = if libType == "static": "staticlib" else: "lib"
+proc genBindingsFor(lang, outDir: string) =
+  exec "nim c --threads:on --app:lib --noMain --mm:refc -d:metrics" &
+    " --nimMainPrefix:liblibp2p -d:ffiGenBindings -d:targetLang=" & lang &
+    " -d:ffiOutputDir=" & outDir & " -d:ffiSrcPath=libp2p.nim" & " --nimcache:nimcache_" &
+    lang & " -o:/dev/null libp2p.nim"
 
-  exec "nim c --out:" & buildDir & "/libp2p." & ext & " --threads:on --app:" & app &
-    " --opt:size --noMain --mm:refc --header -d:metrics" &
-    " --nimMainPrefix:libp2p --nimcache:nimcache libp2p.nim"
+task genbindings_c, "Generate C bindings (cbind/c_bindings)":
+  genBindingsFor("c", "c_bindings")
 
-task libDynamic, "Generate dynamic bindings":
-  buildCBindings "dynamic", ""
-
-task libStatic, "Generate static bindings":
-  buildCBindings "static", ""
+task genbindings_cddl, "Generate CDDL schema (cbind/cddl_bindings)":
+  genBindingsFor("cddl", "cddl_bindings")
 
 proc findFfiVendorDir(): string =
   ## Locates the TinyCBOR sources vendored inside the installed nim-ffi package.
@@ -96,40 +96,3 @@ task examples, "Build and run the C bindings examples":
     exec "gcc -std=c11 -O2 -I c_bindings -I " & vendor & " examples/" & example & ".c " &
       cborObjsStr & " " & lib & " -pthread -Wl,-rpath,'$ORIGIN' -o " & outBin
     exec outBin
-
-# nim-ffi library, built in parallel to the legacy cbind above (see libp2p_ffi.nim).
-# Renamed over libp2p.nim at the flip PR, which drops everything above this line.
-
-proc getLibExt(): string =
-  when defined(windows):
-    "dll"
-  elif defined(macosx):
-    "dylib"
-  else:
-    "so"
-
-proc buildFfiLib() =
-  let buildDir = "../build"
-  if not dirExists buildDir:
-    mkDir buildDir
-  # Name the output `lib<name>` so the file matches the soname nim derives from
-  # the module; `--nimMainPrefix:liblibp2p` matches the `liblibp2pNimMain` symbol
-  # nim-ffi's `declareLibrary` imports.
-  exec "nim c --out:" & buildDir & "/liblibp2p." & getLibExt() &
-    " --threads:on --app:lib --opt:size --noMain --mm:refc -d:metrics" &
-    " --nimMainPrefix:liblibp2p --nimcache:nimcache libp2p_ffi.nim"
-
-task buildffi, "Build the FFI shared library":
-  buildFfiLib()
-
-proc genBindingsFor(lang, outDir: string) =
-  exec "nim c --threads:on --app:lib --noMain --mm:refc -d:metrics" &
-    " --nimMainPrefix:liblibp2p -d:ffiGenBindings -d:targetLang=" & lang &
-    " -d:ffiOutputDir=" & outDir & " -d:ffiSrcPath=libp2p_ffi.nim" &
-    " --nimcache:nimcache_" & lang & " -o:/dev/null libp2p_ffi.nim"
-
-task genbindings_c, "Generate C bindings (cbind/c_bindings)":
-  genBindingsFor("c", "c_bindings")
-
-task genbindings_cddl, "Generate CDDL schema (cbind/cddl_bindings)":
-  genBindingsFor("cddl", "cddl_bindings")
